@@ -1,0 +1,7 @@
+# sample Mon authorization file
+
+trap section
+
+host2 * *
+host2-priv * *
+

@@ -1,0 +1,201 @@
+#!/usr/bin/perl
+#
+# Copyright (C) 2010 United States Government as represented by the
+# Administrator of the National Aeronautics and Space Administration
+# (NASA).  All Rights Reserved.
+#
+# This software is distributed under the NASA Open Source Agreement
+# (NOSA), version 1.3.  The NOSA has been approved by the Open Source
+# Initiative.  See http://www.opensource.org/licenses/nasa1.3.php
+# for the complete NOSA document.
+#
+# THE SUBJECT SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY OF ANY
+# KIND, EITHER EXPRESSED, IMPLIED, OR STATUTORY, INCLUDING, BUT NOT
+# LIMITED TO, ANY WARRANTY THAT THE SUBJECT SOFTWARE WILL CONFORM TO
+# SPECIFICATIONS, ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+# A PARTICULAR PURPOSE, OR FREEDOM FROM INFRINGEMENT, ANY WARRANTY THAT
+# THE SUBJECT SOFTWARE WILL BE ERROR FREE, OR ANY WARRANTY THAT
+# DOCUMENTATION, IF PROVIDED, WILL CONFORM TO THE SUBJECT SOFTWARE. THIS
+# AGREEMENT DOES NOT, IN ANY MANNER, CONSTITUTE AN ENDORSEMENT BY
+# GOVERNMENT AGENCY OR ANY PRIOR RECIPIENT OF ANY RESULTS, RESULTING
+# DESIGNS, HARDWARE, SOFTWARE PRODUCTS OR ANY OTHER APPLICATIONS RESULTING
+# FROM USE OF THE SUBJECT SOFTWARE.  FURTHER, GOVERNMENT AGENCY DISCLAIMS
+# ALL WARRANTIES AND LIABILITIES REGARDING THIRD-PARTY SOFTWARE, IF
+# PRESENT IN THE ORIGINAL SOFTWARE, AND DISTRIBUTES IT "AS IS".
+#
+# RECIPIENT AGREES TO WAIVE ANY AND ALL CLAIMS AGAINST THE UNITED STATES
+# GOVERNMENT, ITS CONTRACTORS AND SUBCONTRACTORS, AS WELL AS ANY PRIOR
+# RECIPIENT.  IF RECIPIENT'S USE OF THE SUBJECT SOFTWARE RESULTS IN ANY
+# LIABILITIES, DEMANDS, DAMAGES, EXPENSES OR LOSSES ARISING FROM SUCH USE,
+# INCLUDING ANY DAMAGES FROM PRODUCTS BASED ON, OR RESULTING FROM,
+# RECIPIENT'S USE OF THE SUBJECT SOFTWARE, RECIPIENT SHALL INDEMNIFY AND
+# HOLD HARMLESS THE UNITED STATES GOVERNMENT, ITS CONTRACTORS AND
+# SUBCONTRACTORS, AS WELL AS ANY PRIOR RECIPIENT, TO THE EXTENT PERMITTED
+# BY LAW.  RECIPIENT'S SOLE REMEDY FOR ANY SUCH MATTER SHALL BE THE
+# IMMEDIATE, UNILATERAL TERMINATION OF THIS AGREEMENT.
+#
+
+use strict;
+use Digest::HMAC_MD5;
+use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use Net::ARP;
+use Net::Arping;
+use Sys::Syslog;
+use XML::Simple;
+
+our $VERSION = 0.19;
+
+my $saverc = "/etc/saverc";
+
+# parse options
+my %opts = ();
+my $rc = GetOptions(\%opts,
+    "u", "O", "T",
+    "l=i",
+    "g=s", "h=s", "s=s", "t=s",
+);
+exit 1 if (!$rc || scalar(@ARGV) > 1);
+
+# parse saverc file
+exit 1 if (! -r $saverc);
+my $config0 = XMLin($saverc,
+    ForceArray => [qw(file host)],
+    KeyAttr => [],
+    NormalizeSpace => 2,
+) or exit 1;
+my $config = $config0->{heartbeat};
+
+my $down = 0;
+if (-f $config->{statedir} . "/save.down") {
+    # set passive and reinitialize if down
+    $ARGV[0] = "passive";
+    $down = 1;
+}
+
+# initialize state file
+my $state_file = $config->{statedir} . "/save." . $config->{address};
+my $old_state;
+if (-l $state_file) {
+    $old_state = readlink $state_file;
+} else {
+    $old_state = "passive " . $config->{priority} if (!$old_state);
+    unlink $state_file;
+    symlink($old_state, $state_file);
+}
+if (scalar(@ARGV) == 1) {
+    my $state = $old_state;
+    my $tstate = $ARGV[0];
+    if ($tstate =~ /take|active/ && $state !~ /active/) {
+        $state =~ s/^\w+/$tstate/;
+    } elsif ($tstate =~ /give|passive/ && $state !~ /passive/) {
+        $state =~ s/^\w+/$tstate/;
+    }
+    if ($state ne $old_state) {
+        mylog("state set to $state" . ($down ? " (down)" : ""));
+        unlink $state_file;
+        symlink($state, $state_file);
+    }
+}
+
+# exit if not trap or traptimeout
+exit 0 if ($ENV{MON_ALERTTYPE} !~ /^trap/);
+exit 1 if (! -l $state_file);
+
+my $tstate = "give 00";
+if ($ENV{MON_ALERTTYPE} eq 'trap') {
+    my @lines = <STDIN>;
+    chomp @lines;
+    splice(@lines, 1, 1);
+    my $tdigest = pop @lines;
+
+    # authenticate message
+    open(KEY, "<" . $config->{key}) or exit 1;
+    my $key = <KEY>;
+    close KEY;
+    chomp $key;
+    my $hmac = Digest::HMAC_MD5->new(pack("H*", $key));
+    $hmac->add(join(" ", @lines));
+    my $digest = $hmac->hexdigest;
+    exit 1 if ($digest ne $tdigest);
+
+    $tstate = shift @lines;
+    my $tip = shift @lines;
+    exit 1 if ($tip ne $config->{address});
+}
+
+# transition to new state
+my $state = $old_state;
+if ($state =~ /give/ && $tstate =~ /active/) {
+    $state =~ s/^\w+/passive/;
+} elsif ($tstate =~ /take/) {
+    $state =~ s/^\w+/give/ unless ($state =~ /take/ && $state gt $tstate);
+} elsif ($tstate =~ /give/ && !$down) {
+    # only become active if not down
+    $state =~ s/^\w+/active/;
+} elsif ($state =~ /active/ && $tstate =~ /active/) {
+    $state =~ s/^\w+/take/;
+}
+unlink $state_file;
+symlink($state, $state_file);
+
+# compare actual and perceived state
+my $force = 0;
+if ($state eq $old_state) {
+    my $addr = qx(ip addr show dev $config->{device});
+    if ($addr =~ /$config->{address}/) {
+        if ($state =~ /passive/) {
+            $force = 1;
+            mylog("state is $state, but failover address found");
+        }
+    } else {
+        if ($state =~ /active/) {
+            $force = 1;
+            mylog("state is $state, but failover address not found");
+        }
+    }
+    # check failover mac is local mac if active
+    if (!$force && $state =~ /active/) {
+        my $mac = Net::ARP::get_mac($config->{device});
+        my $ap = Net::Arping->new;
+        my $apmac = $ap->arping(
+            Host => $config->{address}, Interface => $config->{device});
+        if ($apmac && $mac ne $apmac) {
+            $force = 1;
+            mylog("state is $state, but failover MAC address is $apmac");
+        }
+    }
+} else {
+    $force = 1;
+    mylog("state transition from $old_state to $state" .
+        ($down ? " (down)" : "") . " [$opts{s}:$opts{g}]");
+}
+
+# make changes active
+if ($force && $state =~ /active|passive/) {
+    my $op = "del";
+    if ($state =~ /active/) {
+        mylog("sending gratuitous ARP packets");
+        $op = "add";
+        my $mac = Net::ARP::get_mac($config->{device});
+        for (1..5) {
+            Net::ARP::send_packet($config->{device}, $config->{address},
+                $config->{address}, $mac, 'ff:ff:ff:ff:ff:ff', 'reply');
+        }
+    }
+    mylog(($op eq 'del' ? "removing" : "adding") . " failover address");
+    system("ip addr $op " . $config->{address} . "/" . $config->{prefix} .
+        " dev " . $config->{device});
+}
+
+sub mylog {
+    my $msg = shift;
+    return if (!$config0->{syslog});
+    my $facility = $config0->{syslog}->{facility};
+    $facility = 'user' if (!$facility);
+    openlog("save", 'pid', $facility);
+    my $priority = $config0->{syslog}->{priority};
+    $priority = 'info' if (!$priority);
+    syslog($priority, $msg);
+    closelog();
+}
+
